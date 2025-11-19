@@ -33,7 +33,7 @@ class Config:
     
     # 💰 Trading Parameters
     INITIAL_CAPITAL = 2.0
-    DRY_RUN = False  # ⚠️ SET False UNTUK LIVE TRADING!
+    DRY_RUN = True  # ⚠️ SET False UNTUK LIVE TRADING!
     MIN_ORDER_SIZE = 1.2
     
     # 🎯 Queue System Parameters
@@ -568,3 +568,158 @@ class UltimateTradingBot:
                 signal, confidence = self.strategy.generate_signal(symbol, market_data)
                 
                 # Add high confidence signals to queu
+                if signal != 'NEUTRAL' and confidence >= 0.75:
+                    self.queue_system.add_signal_to_queue(symbol, signal, confidence)
+                    
+            except Exception as e:
+                logger.error(f"Scan error {symbol}: {e}")
+    
+    async def process_trade_queue(self):
+        """Process trade queue"""
+        if not self.capital_manager.can_trade():
+            return
+            
+        signal_data = self.queue_system.process_queue()
+        if not signal_data:
+            return
+            
+        symbol, signal, confidence = signal_data['symbol'], signal_data['signal'], signal_data['confidence']
+        
+        try:
+            # Get current data
+            market_data = self.client.get_kline_data(symbol, '5m', 10)
+            if not market_data:
+                return
+                
+            current_price = market_data[-1]['close']
+            leverage = self.strategy.get_leverage(symbol)
+            position_size = self.capital_manager.get_position_size(confidence)
+            
+            # Calculate SL/TP
+            if signal == 'LONG':
+                stop_loss = current_price * (1 - Config.STOP_LOSS_PCT)
+                take_profit = current_price * (1 + Config.TAKE_PROFIT_PCT)
+                side = 'open_long'
+            else:
+                stop_loss = current_price * (1 + Config.STOP_LOSS_PCT)
+                take_profit = current_price * (1 - Config.TAKE_PROFIT_PCT)
+                side = 'open_short'
+            
+            # Execute order
+            order_result = self.client.place_order(
+                symbol=symbol,
+                side=side,
+                size=position_size,
+                leverage=leverage,
+                stop_loss=stop_loss,
+                take_profit=take_profit
+            )
+            
+            if order_result:
+                self.queue_system.open_position(symbol, signal, position_size, leverage, current_price)
+                
+                # Send alert
+                self.telegram.send_message(
+                    f"🎯 <b>TRADE EXECUTED</b>\n"
+                    f"💰 {symbol} {signal}\n"
+                    f"📊 Size: ${position_size:.2f}\n"
+                    f"🎪 Leverage: {leverage}x\n"
+                    f"📈 Open: {len(self.queue_system.open_positions)}/5"
+                )
+                
+        except Exception as e:
+            logger.error(f"Queue processing error: {e}")
+    
+    async def manage_positions(self):
+        """Manage open positions"""
+        # In live trading, this would check actual position status
+        # For dry run, simulate some management
+        if Config.DRY_RUN and self.queue_system.open_positions:
+            import random
+            if random.random() < 0.1:  # 10% chance to close a position
+                pos = random.choice(self.queue_system.open_positions)
+                pnl = random.choice([0.02, -0.01]) * pos['size']  # +2% or -1%
+                self.queue_system.close_position(pos['symbol'], pnl)
+                self.capital_manager.update_capital(pnl)
+    
+    async def send_status_update(self):
+        """Send status update"""
+        status = self.queue_system.get_queue_status()
+        msg = f"""
+📊 <b>QUEUE STATUS</b>
+────────────────────
+📍 Open Positions: {status['open_positions']}/{status['max_positions']}
+📥 Queue Signals: {status['pending_signals']}
+🎯 Daily Trades: {status['daily_trades']}/{status['max_daily_trades']}
+💰 Capital: ${self.capital_manager.current_capital:.2f}
+⏰ Runtime: {(datetime.now() - self.start_time).seconds // 60}m
+────────────────────
+        """
+        self.telegram.send_message(msg)
+
+class AutoRestart:
+    def __init__(self):
+        self.restart_count = 0
+        self.max_restarts = 5
+        
+    async def run_with_restart(self):
+        """Run with auto-restart"""
+        while self.restart_count < self.max_restarts:
+            try:
+                logger.info(f"🔄 Starting bot (attempt {self.restart_count + 1})")
+                bot = UltimateTradingBot()
+                await bot.run()
+            except Exception as e:
+                self.restart_count += 1
+                logger.error(f"Bot crashed: {e}")
+                if self.restart_count < self.max_restarts:
+                    logger.info("Waiting 30 seconds before restart...")
+                    await asyncio.sleep(30)
+
+# =============================================================================
+# 🚀 MAIN EXECUTION
+# =============================================================================
+
+async def main():
+    print("🚀 Ultimate Trading Bot - Single File")
+    print("=" * 50)
+    
+    # Check API keys
+    required_vars = ['BITGET_API_KEY', 'BITGET_SECRET_KEY', 'BITGET_PASSPHRASE']
+    missing = [var for var in required_vars if not os.getenv(var)]
+    
+    if missing:
+        print(f"❌ ERROR: Missing environment variables: {', '.join(missing)}")
+        print("\n💡 Cara setup:")
+        print("Google Colab:")
+        print("   os.environ['BITGET_API_KEY'] = 'your_key_here'")
+        print("\nTerminal:")
+        print("   export BITGET_API_KEY=your_key_here")
+        print("\nGitHub Secrets:")
+        print("   Set in Repository Settings → Secrets and variables → Actions")
+        return
+    
+    print("✅ API keys verified")
+    print("🤖 Starting Ultimate Trading Bot...")
+    
+    # Run with auto-restart
+    restart_manager = AutoRestart()
+    await restart_manager.run_with_restart()
+
+if __name__ == "__main__":
+    # Check if running in interactive mode (Google Colab)
+    try:
+        import google.colab
+        print("🔍 Detected Google Colab environment")
+        print("💡 Run this in a cell before the bot:")
+        print("""
+import os
+os.environ['BITGET_API_KEY'] = 'your_api_key_here'
+os.environ['BITGET_SECRET_KEY'] = 'your_secret_here'  
+os.environ['BITGET_PASSPHRASE'] = 'your_passphrase_here'
+        """)
+    except ImportError:
+        pass  # Not in Colab
+    
+    # Run the bot
+    asyncio.run(main())
